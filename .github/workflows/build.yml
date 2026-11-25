@@ -1,0 +1,92 @@
+name: Build LANCache ARM64
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['scripts/**', 'tests/**', '.github/workflows/build.yml']
+  pull_request:
+    paths: ['scripts/**', 'tests/**', '.github/workflows/build.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lancache-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s tests -v
+      - name: Resolve published upstream inputs
+        id: inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p build
+          python3 scripts/plan.py > build/inputs.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads(Path('build/inputs.json').read_text())
+          Path('build/plan.json').write_text(json.dumps(data['plan'], indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              print('image=ghcr.io/' + os.environ['GITHUB_REPOSITORY'].lower(), file=out)
+              print('key=' + data['key'], file=out)
+              print('digest=' + data['upstream_digest'].split(':')[1], file=out)
+          PY
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Skip unchanged published inputs
+        id: existing
+        env:
+          IMAGE: ${{ steps.inputs.outputs.image }}
+          KEY: ${{ steps.inputs.outputs.key }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ $EVENT != pull_request ]] && docker manifest inspect "$IMAGE:inputs-$KEY" > /dev/null 2>&1; then
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+            echo 'Upstream and build recipe are unchanged; no build needed.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'skip=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build on native ARM64
+        if: steps.existing.outputs.skip != 'true'
+        run: scripts/build.sh build/plan.json lancache-arm64:test
+      - name: Test HTTP caching before publication
+        if: steps.existing.outputs.skip != 'true'
+        run: scripts/test.sh lancache-arm64:test
+      - name: Publish tested image
+        if: steps.existing.outputs.skip != 'true' && github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.inputs.outputs.image }}
+          KEY: ${{ steps.inputs.outputs.key }}
+          DIGEST: ${{ steps.inputs.outputs.digest }}
+        run: |
+          # Publish the completion marker last so partial pushes are retried.
+          for tag in "upstream-$DIGEST-$KEY" latest "inputs-$KEY"; do
+            docker tag lancache-arm64:test "$IMAGE:$tag"
+            docker push "$IMAGE:$tag"
+          done
+          {
+            echo "Published \`$IMAGE:latest\` from inputs \`$KEY\`."
+            echo '```json'
+            cat build/plan.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
